@@ -1,0 +1,399 @@
+// Governance explorer pages (DAG_SPEC.md section 17): the dev council and the upgrade path (/upgrades) and the
+// emergency pause (/pause), plus the pause banner every page shows while something is paused. Forms use the visitor's
+// browser wallet (app.js); the node only reads.
+
+import { ADDR, NODE_VERSION, PROTOCOL_VERSION, versionText, DEV_ACCOUNTS } from './params.js';
+import { keccak256 } from '../../common/crypto.js';
+import { bytesToHex } from '../../common/bytes.js';
+import { createHash } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { T } from './i18n.js';
+
+const ACTION_KIND = ['Approve update', 'Cancel update', 'Change parameter', 'Pause', 'End pause', 'Cancel action'];
+const ACTION_STATE = ['waiting for a second key', 'in timelock', 'done', 'cancelled'];
+const PLAN_STATE = ['submitted', 'approved, in timelock', 'in force', 'cancelled', 'failed (code changed)'];
+const BY = ['', 'dev council', 'finality committee', 'DAO vote'];
+const PER = 25;
+
+export function installV8Pages(Explorer, H) {
+  const { esc, num, when, badge, short } = H;
+  const P = Explorer.prototype;
+  // the helpers translate their headings, labels and empty texts (pages pass them in English)
+  const table = (head, rows, empty) => `<div class="table-responsive"><table><thead><tr>${head.map((x) => `<th>${T(x)}</th>`).join('')}</tr></thead><tbody>` +
+    (rows.length ? rows.join('') : `<tr><td colspan="${head.length}">${T(empty)}</td></tr>`) + '</tbody></table></div>';
+  const kv = (rows) => `<div class="table-responsive"><table>${rows.map(([k, v]) => `<tr><th>${T(k)}</th><td>${v}</td></tr>`).join('')}</table></div>`;
+  const ZERO = '0x0000000000000000000000000000000000000000';
+  const PAUSABLE = [['Whole network', ZERO], ['MinerRegistry', ADDR.minerRegistry], ['NGORegistry', ADDR.ngoRegistry], ['Attestation', ADDR.attestation],
+    ['VoteEscrow', ADDR.voteEscrow], ['NGOElection', ADDR.ngoElection], ['RoleElection', ADDR.roleElection], ['Treasury', ADDR.treasury],
+    ['NGORewards', ADDR.ngoRewards], ['FinalityCommittee', ADDR.finalityCommittee], ['FundApprovals', ADDR.fundApprovals]]
+    .map(([n, a]) => [n, typeof a === 'string' ? a : '0x' + bytesToHex(a)]);
+  const targetName = (a) => T(PAUSABLE.find(([, x]) => x === String(a).toLowerCase())?.[0] ?? short(a));
+  const ago = (t, now) => { const d = Number(t) - now; const h = Math.round(Math.abs(d) / 3600); return d > 0 ? (h < 48 ? T('in {n} h', { n: h }) : T('in {n} days', { n: Math.round(h / 24) })) : T('reached'); };
+
+  /** Council, registry and pause state at the tip, cached per tip. */
+  /** The contracts an emergency pause can name, [name, address] (the proposal builder offers the same list). */
+  P.pausableTargets = function () { return PAUSABLE; };
+
+  P.v8State = async function () {
+    const c = this.chain;
+    if (this.v8Cache?.tip === c.tip.hash) return this.v8Cache.value;
+    const value = await this.reads(async (read) => {
+      const keys = await read('DevCouncil', 'keys');
+      const nActions = Number(await read('DevCouncil', 'actionCount') ?? 0n);
+      const actions = [];
+      for (let i = nActions - 1; i >= Math.max(0, nActions - PER); i--) actions.push({ id: i, a: await read('DevCouncil', 'getAction', [BigInt(i)]) });
+      const nPlans = Number(await read('UpgradeRegistry', 'planCount') ?? 0n);
+      // approved plans waiting for their timelock are always listed (anyone can submit, so the newest submissions
+      // could otherwise push them off the page), then the newest submissions
+      const w = await read('UpgradeRegistry', 'waiting');
+      const ids = [...new Set([...(w?.[0] ?? []), ...(w?.[1] ?? [])].map(Number))].sort((a, b) => b - a);
+      for (let i = nPlans - 1; i >= Math.max(0, nPlans - PER); i--) if (!ids.includes(i)) ids.push(i);
+      const plans = [];
+      for (const i of ids) {
+        const p = await read('UpgradeRegistry', 'getPlan', [BigInt(i)]);
+        if (p) plans.push({ id: i, p: { ...p, eta: await read('UpgradeRegistry', 'effectiveEta', [BigInt(i)]) ?? p.eta } });
+      }
+      const pauses = [];
+      for (const [name, addr] of PAUSABLE) {
+        const x = await read('EmergencyPause', 'pauses', [addr]);
+        if (x) pauses.push({ name, addr, by: Number(x[0]), at: Number(x[1]), until: Number(x[2]), reason: x[3] });
+      }
+      const nHist = Number(await read('EmergencyPause', 'historyCount') ?? 0n);
+      const history = [];
+      for (let i = nHist - 1; i >= Math.max(0, nHist - PER); i--) history.push(await read('EmergencyPause', 'history', [BigInt(i)]));
+      const nReq = Number(await read('EmergencyPause', 'requestCount') ?? 0n);
+      const requests = [];
+      for (let i = nReq - 1; i >= Math.max(0, nReq - 10); i--) requests.push({ id: i, r: await read('EmergencyPause', 'request', [BigInt(i)]) });
+      return {
+        retired: Boolean(await read('DevCouncil', 'retired')), retiredAt: Number(await read('DevCouncil', 'retiredAt') ?? 0n), keys, actions, nActions,
+        plans, nPlans, required: Number(await read('UpgradeRegistry', 'requiredVersion') ?? 0n), pauses, history, nHist, requests,
+        lastCouncilPause: Number(await read('EmergencyPause', 'lastCouncilPauseAfterHandover') ?? 0n), lockout: Number(await read('EmergencyPause', 'councilLockoutUntil') ?? 0n),
+        elected: Number(await read('NGOElection', 'electedCount') ?? 0n),
+      };
+    });
+    this.v8Cache = { tip: c.tip.hash, value };
+    return value;
+  };
+
+  /** Pauses running now (refreshed with the mode before each page). */
+  P.refreshPause = async function () {
+    if (this.pauseNow?.tip === this.chain.tip.hash) return;
+    const now = Number(this.chain.tip.header.timestamp); // block time, as the contracts judge a pause
+    const list = await this.reads(async (read) => {
+      const out = [];
+      for (const [name, addr] of PAUSABLE) {
+        const x = await read('EmergencyPause', 'pauses', [addr]);
+        if (x && Number(x[2]) > now) out.push({ name, until: Number(x[2]), by: Number(x[0]), reason: x[3] });
+      }
+      return out;
+    }).catch(() => []);
+    this.pauseNow = { tip: this.chain.tip.hash, list };
+  };
+
+  P.pauseBanner = function () {
+    const list = this.pauseNow?.list ?? [];
+    if (!list.length) return '';
+    const items = list.map((x) => T('{name} paused by the {by} until {t} (reason {r})', { name: `<strong>${esc(T(x.name))}</strong>`, by: esc(T(BY[x.by] ?? '?')), t: esc(when(x.until)), r: `<code>${esc(short(x.reason))}</code>` })).join('; ');
+    const net = list.some((x) => x.name === 'Whole network');
+    return `<div class="pz-banner" role="alert"><div class="container">${items}. ${net ? T('Transfers and ordinary transactions wait until the pause ends; mining, votes, upgrades and DevVesting releases continue.') + ' ' : ''}<a href="/pause">${T('Details')}</a></div></div>`;
+  };
+
+  // ------------------------------------------------------------------ /upgrades
+
+  P.upgradesPage = async function () {
+    const d = await this.v8State();
+    const now = Number(this.chain.tip.header.timestamp); // block time, as the contracts judge a pause
+    const [accounts, current, pending, etas] = d.keys ?? [[], [], [], []];
+    const seats = DEV_ACCOUNTS.map((x, i) => `<tr><td>${esc(T(x.label))}</td><td>${this.addr(accounts[i] ?? ZERO)}</td><td>${current[i] && current[i] !== ZERO ? `<code>${esc(current[i])}</code>` : `<span class="muted">${T('none')}</span>`}</td>` +
+      `<td>${pending[i] && pending[i] !== ZERO ? T('{key} from {t}', { key: `<code>${esc(short(pending[i]))}</code>`, t: esc(when(etas[i])) }) : '–'}</td></tr>`);
+    const acts = d.actions.map(({ id, a }) => {
+      const k = Number(a.kind), approvals = [0, 1, 2].filter((s) => Number(a.approvals) & (1 << s)).map((s) => s + 1).join(', ');
+      const what = k === 2 ? `<code>${esc(Buffer.from(String(a.key).slice(2), 'hex').toString().replace(/\0+$/, ''))}</code> = ${esc(String(a.arg))}`
+        : k <= 1 ? T('plan {n}', { n: esc(String(a.arg)) }) : k === 5 ? T('action {n}', { n: esc(String(a.arg)) }) : esc(targetName(a.target));
+      return `<tr><td>${id}</td><td>${esc(T(ACTION_KIND[k] ?? '?'))}</td><td>${what}</td><td>${T('seats {list}', { list: approvals })}</td><td>${esc(T(ACTION_STATE[Number(a.state)] ?? '?'))}${Number(a.state) === 1 ? `<div class="muted">${T('executable {t}', { t: esc(when(a.eta)) })}</div>` : ''}</td></tr>`;
+    });
+    // the SHA-256 of the SHA256SUMS.txt this node serves, to compare with node update plans
+    const ownRelease = (() => { try { const dir = this.downloads?.dir; return dir ? '0x' + createHash('sha256').update(fs.readFileSync(path.join(dir, 'SHA256SUMS.txt'))).digest('hex') : null; } catch { return null; } })();
+    const plans = d.plans.map(({ id, p }) => {
+      const st = Number(p.state);
+      const what = Number(p.kind) === 0
+        ? T('replace {name} with the code at {addr}', { name: `<b>${esc(T(this.labels.get(String(p.target).slice(2).toLowerCase()) ?? short(p.target)))}</b>`, addr: this.addr(p.impl) }) + `<div class="muted">${T('code hash {h}', { h: `<code>${esc(short(p.codeHash))}</code>` })}</div>`
+        : T('node {v}', { v: `<b><a href="/upgrade/${id}">${esc(versionText(Number(p.version)))}</a></b>` }) + `<div class="muted">SHA256SUMS.txt <code>${esc(short(p.releaseHash))}</code>${ownRelease ? ' · ' + (ownRelease === String(p.releaseHash).toLowerCase() ? T('matches this node\'s downloads') : T('not the downloads this node serves')) : ''}</div>`;
+      return `<tr><td>${Number(p.kind) === 1 ? `<a href="/upgrade/${id}">${id}</a>` : id}</td><td>${what}<div class="muted">${T('commit {c} · submitted by {a}', { c: `<code>${esc(String(p.commit).slice(0, 12))}</code>`, a: this.addr(p.submitter) })}</div></td>` +
+        `<td>${esc(T(PLAN_STATE[st] ?? '?'))}${st === 1 ? `<div class="muted">${T('takes effect {t} ({ago})', { t: esc(when(p.eta)), ago: esc(ago(p.eta, now)) })}</div>` : ''}${st === 2 ? `<div class="muted">${esc(when(p.activatedAt))}</div>` : ''}</td>` +
+        `<td>${st >= 1 && st !== 3 ? esc(p.byDao ? T('DAO vote') : T('dev council')) : '–'}</td></tr>`;
+    });
+    const behind = d.required > 0 && d.required > versionNumberOf(PROTOCOL_VERSION);
+    const status = d.retired
+      ? `${badge('retired', false)} ${T('since {t}: the 60th NGO was elected. Updates now need an Upgrade proposal (token vote and a majority of the elected NGOs). The council keeps only the emergency pause.', { t: esc(when(d.retiredAt)) })}`
+      : `${badge('active', true)} ${T('until 60 NGOs are elected for the first time (now {n}). Then it retires for good.', { n: num(d.elected) })}`;
+    const body = `<p class="eyebrow">${T('Upgrades and dev council')}</p><h1>${T('Every update: submit, approve, wait, take effect.')}</h1>` +
+      `<p class="lead">${T('Contract and node updates are submitted here and wait out a public timelock before they take effect. Until 60 NGOs are first elected, two of the three dev council keys can approve node updates (7 days; each operator chooses to install them). Contract updates, and after the handover every update, need a DAO vote with a majority of the elected NGOs: 7 days for contracts, 14 days for nodes.')}</p>` +
+      this.walletBar() +
+      `<div class="grid2"><div class="panel stat">${T('Dev council')}<strong>${d.retired ? T('retired') : T('active')}</strong></div><div class="panel stat">${T('Elected NGOs')}<strong>${num(d.elected)} / 60</strong></div>` +
+      `<div class="panel stat">${T('Protocol version required')}<strong>${d.required ? esc(versionText(d.required)) : T('none yet')}</strong></div><div class="panel stat">${T('This node')}<strong>${esc(NODE_VERSION)} · ${T('protocol {v}', { v: esc(PROTOCOL_VERSION) })}</strong></div></div>` +
+      (behind ? `<div class="warn">${T('This node runs {a} but the network requires {b}: it has stopped following the chain. Update it.', { a: esc(T('protocol {v}', { v: PROTOCOL_VERSION })), b: esc(T('protocol {v}', { v: versionText(d.required) })) })}</div>` : '') +
+      `<h2 class="mt-4">${T('Dev council')}</h2><p>${status}</p>` +
+      `<div class="warn">${T('The council can never touch the Treasury, balances, the 12 % (DevVesting), the NGO election or its rules, or the handover rule, and it replaces no contract: every system contract holds PSY or feeds the election, the Treasury or the volunteer fund. It can approve node updates, change the committee bond and the role candidacy deposit (48 hours), and pause (at most 7 days in a row before the handover, then 7 days without).')}</div>` +
+      table(['Seat', 'Dev Account wallet', 'Council key', 'Key change waiting'], seats, '') +
+      `<h3 class="h5 mt-3">${T('Council actions')}</h3>` + table(['#', 'Action', 'What', 'Approved by', 'State'], acts, 'No council actions yet.') +
+      `<h2 class="mt-4">${T('Update plans')}</h2>` + table(['#', 'Update', 'State', 'Approved by'], plans, 'Nothing submitted yet.') +
+      `<h2 class="mt-4">${T('Check an update yourself')}</h2><ol class="steps">` +
+      `<li>${T('<b>Contract update:</b> check out the plan\'s commit, run <code>cd contracts && forge build</code>, and compare <code>keccak256</code> of the runtime code with the plan\'s code hash (<code>cast keccak $(cast code &lt;new code address&gt; --rpc-url https://rpc.psyrob.com)</code>). The node copies the code only if the hash still matches when the timelock ends.')}</li>` +
+      `<li>${T('<b>Node update:</b> download the release, run <code>sha256sum SHA256SUMS.txt</code> and compare with the plan; then <code>sha256sum -c SHA256SUMS.txt</code> checks every file. From the activation block, nodes older than the required version stop and say so.')}</li></ol>` +
+      `<h2 class="mt-4">${T('Submit and approve')}</h2><div class="grid2">` +
+      this.txForm('UpgradeRegistry', 'submit', 'Submit an update (anyone)', [['Kind', 'select', `<option value="0">${T('Contract update')}</option><option value="1">${T('Node update')}</option>`],
+        ['Contract to replace (contract updates; else 0x000…)', 'address', '0x7070…', ZERO], ['Address of the new code (contract updates; else 0x000…)', 'address', '0x…', ZERO],
+        ['Node version number (node updates: 10.1.0 = 10001000; else 0)', 'uint', '0'], ['Git commit (0x + 40 hex)', 'bytes20', '0x…'],
+        ['SHA-256 of SHA256SUMS.txt (node updates; else 0x00…)', 'bytes32', '0x…', '0x' + '00'.repeat(32)], ['Description', 'string', 'What it changes and why']]) +
+      this.txForm('DevCouncil', 'propose', 'Council: propose an action (first key)', [['Action', 'select', ACTION_KIND.map((n, i) => `<option value="${i}">${T(n)}</option>`).join('')],
+        ['Target (pause: contract or 0x000… for the whole network)', 'address', '0x…', ZERO], ['Parameter name hex or reason hash (0x + 64 hex)', 'bytes32', '0x…', '0x' + '00'.repeat(32)],
+        ['Number (plan, action or new parameter value)', 'uint', '0']], { note: 'Sent from a council key. A second key approves with the form below; pauses and node update approvals take effect at once (the update then waits its 7 days), parameter changes (committeeBond, candidacyDeposit) after 48 hours.' }) +
+      this.txForm('DevCouncil', 'approve', 'Council: approve an action (second key)', [['Action number', 'uint', '0']]) +
+      this.txForm('DevCouncil', 'execute', 'Run a parameter change after 48 hours (anyone)', [['Action number', 'uint', '0']]) +
+      this.txForm('DevCouncil', 'requestKeyChange', 'Replace a council key (from the Dev Account wallet)', [['Seat (0, 1 or 2)', 'uint', '0'], ['New council key', 'address', '0x…']],
+        { note: 'Takes effect after 48 hours. Another seat can cancel it in that time.' }) +
+      this.txForm('DevCouncil', 'cancelKeyChange', 'Cancel another seat\'s key change (council key)', [['Seat (0, 1 or 2)', 'uint', '0']]) +
+      this.txForm('DevCouncil', 'applyKeyChange', 'Apply a key change after 48 hours (anyone)', [['Seat (0, 1 or 2)', 'uint', '0']]) +
+      `</div><p class="muted">${T('After the handover, approve with an <a href="/governance">Upgrade proposal</a>: target {t}, calldata <code>approve(planNumber)</code>.', { t: `<code>${esc('0x' + bytesToHex(ADDR.upgradeRegistry))}</code>` })}</p>`;
+    return this.layout('Upgrades', body, '/upgrades', { scripts: this.appScripts() });
+  };
+
+  // ------------------------------------------------------------------ /upgrade: council approval of node updates
+
+  const ZERO32 = '0x' + '00'.repeat(32);
+  const ACTION_TTL = 3 * 86400; // DevCouncil.ACTION_TTL: a first signature expires unless a second key approves in time
+
+  /** The plan description as written for the approval page: title, release, consensus change, changes. */
+  P.parsePlanText = function (text) {
+    const lines = String(text ?? '').split(/\r?\n/);
+    let consensus = null, release = null;
+    const rest = [];
+    for (const l of lines) {
+      const c = /^\s*consensus(?:\s+change)?\s*:\s*(yes|no)\b/i.exec(l);
+      const r = /^\s*release\s*:\s*(\S{1,32})/i.exec(l);
+      if (c) consensus = c[1].toLowerCase() === 'yes'; else if (r) release = r[1]; else rest.push(l);
+    }
+    const title = (rest.find((l) => l.trim()) ?? '').trim();
+    const notes = rest.slice(rest.findIndex((l) => l.trim()) + 1).join('\n').trim();
+    return { title, release, consensus, notes };
+  };
+
+  /** Everything the approval page shows about one plan, read on one consistent tip state. */
+  P.upgradeData = async function (id) {
+    const ev = this.events();
+    const acts = (ev.planActions.get(id) ?? []).slice(-20);
+    return this.reads(async (read) => {
+      const n = Number(await read('UpgradeRegistry', 'planCount') ?? 0n);
+      if (id >= n) return null;
+      const p = await read('UpgradeRegistry', 'getPlan', [BigInt(id)]);
+      const actions = [];
+      for (const x of acts) actions.push({ ...x, a: await read('DevCouncil', 'getAction', [BigInt(x.action)]) });
+      const required = Number(await read('UpgradeRegistry', 'requiredVersion') ?? 0n);
+      const base = Number(await read('UpgradeRegistry', 'BASE_VERSION') ?? 10_000_000n);
+      return {
+        p, actions, required, base, eta: Number(await read('UpgradeRegistry', 'effectiveEta', [BigInt(id)]) ?? p.eta),
+        oneStep: Number(p.kind) === 1 ? Boolean(await read('UpgradeRegistry', 'oneStep', [p.version])) : false,
+        keys: await read('DevCouncil', 'keys'), retired: Boolean(await read('DevCouncil', 'retired')),
+        text: ev.plans.get(id) ?? null,
+      };
+    });
+  };
+
+  /** The live first-signature action of a plan (approve kind, not done, not expired), or null. */
+  const pendingAction = (d, now) => d.actions.filter((x) => x.kind === 0 && x.a && Number(x.a.state) === 0 && now <= Number(x.a.proposedAt) + ACTION_TTL).at(-1) ?? null;
+  const seatsOf = (bits) => [0, 1, 2].filter((s) => Number(bits) & (1 << s));
+
+  /** The versions the council may approve next: one patch or one minor step above max(required, base). */
+  const nextSteps = (required, base) => {
+    const b = Math.max(required, base), M = Math.floor(b / 1_000_000), m = Math.floor(b / 1_000) % 1_000, pt = b % 1_000;
+    return [M * 1_000_000 + (m + 1) * 1_000, M * 1_000_000 + m * 1_000 + pt + 1];
+  };
+
+  P.upgradePage = async function (ref) {
+    if (!/^\d{1,9}$/.test(ref)) return { notFound: this.layout(T('Node upgrade approval'), `<h1>${T('Not a plan number')}</h1>`, '/upgrade') };
+    const id = Number(ref);
+    const d = await this.upgradeData(id);
+    if (!d) return { notFound: this.layout(T('Node upgrade approval'), `<h1>${T('No such plan')}</h1><p><a href="/upgrade">${T('All node updates')}</a></p>`, '/upgrade') };
+    const now = Number(this.chain.tip.header.timestamp);
+    const p = d.p, st = Number(p.state), node = Number(p.kind) === 1;
+    const desc = d.text?.description ?? null;
+    const verified = desc !== null && ('0x' + bytesToHex(keccak256(new TextEncoder().encode(desc)))) === String(p.descriptionHash).toLowerCase();
+    const info = this.parsePlanText(desc);
+    const pend = pendingAction(d, now);
+    const signed = pend ? seatsOf(pend.a.approvals) : [];
+    const approvedBy = st >= 1 && st !== 3 ? (p.byDao ? 'DAO vote' : 'dev council') : null;
+    const councilCan = node && !d.retired && d.oneStep && st === 0;
+    const commit = String(p.commit).toLowerCase();
+    // status line
+    let status;
+    if (st === 3) status = badge('cancelled');
+    else if (st === 2) status = `${badge('in force', true)} ${T('since {t}: nodes below protocol {v} have stopped following the chain.', { t: esc(when(p.activatedAt)), v: esc(versionText(Number(p.version))) })}`;
+    else if (st === 1) status = `${badge('approved', true)} ${T('by the {by}; takes effect {t} ({ago}).', { by: esc(T(approvedBy)), t: esc(when(d.eta)), ago: esc(ago(d.eta, now)) })}`;
+    else if (!node) status = `${badge('submitted')} ${T('A contract update needs a DAO vote: the council approves node updates only.')}`;
+    else if (d.retired) status = `${badge('submitted')} ${T('The dev council has retired: this update needs an <a href="/governance">Upgrade proposal</a> (DAO vote).')}`;
+    else if (!d.oneStep) status = `${badge('submitted')} ${T('The council can approve only the next step above protocol {v} ({a} or {b}); this version needs a DAO vote.', { v: esc(versionText(Math.max(d.required, d.base))), a: esc(versionText(nextSteps(d.required, d.base)[0])), b: esc(versionText(nextSteps(d.required, d.base)[1])) })}`;
+    else if (pend) status = `${badge('waiting for council signatures', true)} ${T('{k} of 2 signatures; the first expires {t} unless a second council key signs.', { k: signed.length, t: esc(when(Number(pend.a.proposedAt) + ACTION_TTL)) })}`;
+    else status = `${badge('submitted')} ${T('Waiting for a first council signature.')}`;
+    // the steps
+    const step = (done, title, detail) => `<li class="${done ? 'ok' : 'no'}"><span>${done ? '✓' : '○'}</span> <b>${title}</b>${detail ? ` <span class="muted">${detail}</span>` : ''}</li>`;
+    const steps = `<ul class="check">` +
+      step(true, T('Submitted'), T('{t} by {a}', { t: esc(when(p.submittedAt)), a: this.addr(p.submitter) })) +
+      step(st >= 1 && st !== 3, T('Approved (2 of 3 council keys, or a DAO vote)'), st >= 1 && st !== 3 ? esc(when(p.approvedAt)) : pend ? T('{k} of 2 signatures', { k: signed.length }) : '') +
+      step(st === 2 || (st === 1 && d.eta <= now), T('Timelock passed (7 days for the council, 14 for the DAO)'), st === 1 || st === 2 ? esc(when(d.eta)) : '') +
+      step(st === 2, T('In force: the network requires this protocol version'), st === 2 ? esc(when(p.activatedAt)) : '') + '</ul>';
+    // seats
+    const [accounts, current] = d.keys ?? [[], []];
+    const seatRows = DEV_ACCOUNTS.map((x, i) => {
+      const k = current?.[i] && current[i] !== ZERO ? current[i] : null;
+      const done = signed.includes(i) || (st >= 1 && st !== 3 && !p.byDao && d.actions.some((y) => y.kind === 0 && y.a && Number(y.a.state) === 2 && seatsOf(y.a.approvals).includes(i)));
+      return `<tr><td>${esc(T(x.label))}</td><td>${this.addr(accounts?.[i] ?? ZERO)}</td><td>${k ? `<code>${esc(k)}</code>` : `<span class="muted">${T('none')}</span>`}</td>` +
+        `<td>${done ? badge('signed', true) : st === 0 && councilCan ? badge('not yet') : '–'}</td></tr>`;
+    });
+    // what a council member can do now
+    let act = '';
+    if (councilCan) {
+      act = `<div class="panel guide mt-3"><h2 class="h5">${T('Sign as a council member')}</h2><p class="muted">${T('Connect the wallet that holds your council key (not your Dev Account wallet). Two of the three keys must sign within 3 days. The update then waits 7 days in public before it takes effect.')}</p>` +
+        this.walletBar() +
+        (pend
+          ? this.rowTx('DevCouncil', 'approve', T('Sign: approve this update (second key)'), [['uint', String(pend.action)]]) + ` <span class="muted small">${T('council action {n}', { n: pend.action })}</span>`
+          : this.rowTx('DevCouncil', 'propose', T('Sign: start the approval (first key)'), [['uint', '0'], ['address', ZERO], ['bytes32', ZERO32], ['uint', String(id)]])) +
+        `<details class="mt-2"><summary class="small">${T('Stop this update')}</summary><p class="muted small">${T('A cancellation needs two council keys as well. Until the update is in force the council can still cancel it.')}</p>` +
+        this.rowTx('DevCouncil', 'propose', T('Propose to cancel (first key)'), [['uint', '1'], ['address', ZERO], ['bytes32', ZERO32], ['uint', String(id)]], { line: true }) + '</details></div>';
+    } else if (node && st === 1 && !p.byDao && !d.retired) {
+      act = `<div class="panel mt-3"><h2 class="h5">${T('Stop this update')}</h2><p class="muted small">${T('A cancellation needs two council keys as well. Until the update is in force the council can still cancel it.')}</p>` + this.walletBar() +
+        this.rowTx('DevCouncil', 'propose', T('Propose to cancel (first key)'), [['uint', '1'], ['address', ZERO], ['bytes32', ZERO32], ['uint', String(id)]], { line: true }) + '</div>';
+    }
+    const ownRelease = (() => { try { const dir = this.downloads?.dir; return dir ? '0x' + createHash('sha256').update(fs.readFileSync(path.join(dir, 'SHA256SUMS.txt'))).digest('hex') : null; } catch { return null; } })();
+    const consensus = info.consensus === null ? `<span class="muted">${T('not stated in the description')}</span>` : info.consensus ? badge('yes: new consensus rules', true) : badge('no');
+    const rows = [
+      ['Plan', String(id)], ['Kind', node ? T('Node update') : T('Contract update')],
+      ...(node ? [['Protocol version', `<b>${esc(versionText(Number(p.version)))}</b> <span class="muted">${T('(now required: {v})', { v: d.required ? esc(versionText(d.required)) : T('none yet') })}</span>`],
+        ['Node release', info.release ? esc(info.release) : `<span class="muted">${T('not stated in the description')}</span>`], ['Consensus change', consensus]] : []),
+      ['Git commit', `<code>${esc(commit)}</code> <a href="https://github.com/psyrob-blockchain/psyrob/commit/${esc(commit.slice(2))}" rel="noopener">GitHub</a>`],
+      ...(node ? [['SHA-256 of SHA256SUMS.txt', `<code>${esc(String(p.releaseHash))}</code>${ownRelease ? '<div class="muted">' + (ownRelease === String(p.releaseHash).toLowerCase() ? T('matches this node\'s downloads') : T('not the downloads this node serves')) + '</div>' : ''}`]] : []),
+      ['Status', status],
+    ];
+    const text = desc === null ? `<p class="muted">${T('The description is not in this node\'s event index yet.')}</p>`
+      : `<p>${verified ? badge('description matches the hash on chain', true) : badge('description does not match the hash on chain')}</p>` +
+        (info.title ? `<p><b>${esc(info.title)}</b></p>` : '') + (info.notes ? `<pre class="code">${esc(info.notes)}</pre>` : '');
+    const body = `<p class="eyebrow">${T('Node upgrade approval')}</p><h1>${esc(info.title || T('Plan {n}', { n: id }))}</h1>` +
+      kv(rows) + `<h2 class="mt-4">${T('Progress')}</h2>` + steps +
+      `<h2 class="mt-4">${T('Council signatures')}</h2>` + table(['Seat', 'Dev Account wallet', 'Council key', 'Signed'], seatRows, '') + act +
+      `<h2 class="mt-4">${T('What changes')}</h2>` + text +
+      `<h2 class="mt-4">${T('Check it yourself')}</h2><ol class="steps"><li>${T('Download the release and run <code>sha256sum SHA256SUMS.txt</code>: it must equal the hash above. <code>sha256sum -c SHA256SUMS.txt</code> then checks every file.')}</li>` +
+      `<li>${T('Signatures are checked by the DevCouncil contract itself: only the three council keys can sign, each once, and the plan changes state only when two have signed. Anyone can read them with <code>getAction</code> on <a href="/contract/DevCouncil">DevCouncil</a>.')}</li>` +
+      `<li>${T('No new genesis and no launch ceremony: the chain, balances and history stay. Nodes update in the 7 days; a node below the required protocol version stops at the activation block and says so.')}</li></ol>` +
+      `<p><a href="/upgrade">${T('All node updates')}</a> · <a href="/upgrades">${T('Upgrades and council')}</a></p>`;
+    return this.layout(T('Node upgrade approval'), body, '/upgrade', { scripts: this.appScripts() });
+  };
+
+  /** /upgrade: node updates waiting for the council, the history, and the form to propose one. */
+  P.upgradeInbox = async function () {
+    const d = await this.v8State();
+    const now = Number(this.chain.tip.header.timestamp);
+    const ev = this.events();
+    const base = 10_000_000;
+    const steps = nextSteps(d.required, base);
+    const rows = d.plans.filter(({ p }) => Number(p.kind) === 1).map(({ id, p }) => {
+      const info = this.parsePlanText(ev.plans.get(id)?.description);
+      const st = Number(p.state);
+      const pend = st === 0 ? (ev.planActions.get(id) ?? []).filter((x) => x.kind === 0).at(-1) : null;
+      return `<tr><td><a href="/upgrade/${id}">${id}</a></td><td><a href="/upgrade/${id}">${esc(versionText(Number(p.version)))}</a>${info.release ? ` <span class="muted">${T('release {r}', { r: esc(info.release) })}</span>` : ''}</td>` +
+        `<td>${esc(info.title.slice(0, 90))}</td><td>${info.consensus === null ? '–' : info.consensus ? T('yes') : T('no')}</td>` +
+        `<td>${esc(T(PLAN_STATE[st] ?? '?'))}${st === 1 ? `<div class="muted">${T('takes effect {t} ({ago})', { t: esc(when(p.eta)), ago: esc(ago(p.eta, now)) })}</div>` : ''}${pend ? `<div class="muted">${T('council action {n} started', { n: pend.action })}</div>` : ''}</td></tr>`;
+    });
+    const tmpl = `PSYROB node 11.1.0: <one-line summary>\nRelease: 11.1.0\nConsensus change: yes\n\nChanges:\n- …\n- …\n\nOperators: update within 7 days of the approval.`;
+    const form = d.retired ? '' : `<h2 class="mt-4">${T('Propose a node update')}</h2><form class="tx panel" data-c="UpgradeRegistry" data-f="submit" data-n="7">` +
+      `<input type="hidden" data-i="0" data-kind="uint" value="1"><input type="hidden" data-i="1" data-kind="address" value="${ZERO}"><input type="hidden" data-i="2" data-kind="address" value="${ZERO}">` +
+      `<label for="nu-v">${T('Protocol version')}</label><select class="form-select" id="nu-v" data-i="3" data-kind="uint">${steps.map((v) => `<option value="${v}">${esc(versionText(v))}</option>`).join('')}</select>` +
+      `<p class="muted small">${T('The council can approve the next minor step (new consensus rules) or the next patch step (a required fix) above the protocol version in force.')}</p>` +
+      `<label for="nu-c">${T('Git commit (0x + 40 hex)')}</label><input class="form-control" id="nu-c" data-i="4" data-kind="bytes20" placeholder="0x…">` +
+      `<label for="nu-h">${T('SHA-256 of SHA256SUMS.txt (node updates; else 0x00…)')}</label><input class="form-control" id="nu-h" data-i="5" data-kind="bytes32" placeholder="0x…">` +
+      `<label for="nu-d">${T('Description')}</label><textarea class="form-control" id="nu-d" data-i="6" rows="9">${esc(tmpl)}</textarea>` +
+      `<p class="muted small">${T('Keep the lines <code>Release:</code> and <code>Consensus change: yes</code> or <code>no</code>: the approval page reads them. The text is published with the plan and its hash is stored on chain.')}</p>` +
+      `<button class="btn btn-cyan mt-3" type="submit">${T('Send with wallet')}</button><div class="out muted"></div></form>`;
+    const body = `<p class="eyebrow">${T('Node upgrade approval')}</p><h1>${T('Node updates without a new genesis.')}</h1>` +
+      `<p class="lead">${T('A node update is submitted on chain, signed by two of the three dev council keys, waits 7 days in public, and then the network requires its protocol version. The chain, balances and history stay; the launch ceremony is only for a new network.')}</p>` +
+      `<div class="grid2"><div class="panel stat">${T('Protocol version required')}<strong>${d.required ? esc(versionText(d.required)) : T('none yet')}</strong></div><div class="panel stat">${T('This node')}<strong>${esc(NODE_VERSION)} · ${T('protocol {v}', { v: esc(PROTOCOL_VERSION) })}</strong></div></div>` +
+      table(['#', 'Protocol version', 'Summary', 'Consensus change', 'State'], rows, 'No node updates yet.') + form +
+      `<p class="muted mt-3">${T('How it works, step by step: <a href="https://github.com/psyrob-blockchain/psyrob/blob/main/docs/NODE-UPGRADES.md" rel="noopener">docs/NODE-UPGRADES.md</a>.')}</p>`;
+    return this.layout(T('Node upgrade approval'), body, '/upgrade', { scripts: this.appScripts() });
+  };
+
+  /** Node updates the council has started signing or approved and not yet in force (refreshed per tip). */
+  P.refreshUpgrades = async function () {
+    if (this.upgradeNow?.tip === this.chain.tip.hash) return;
+    const now = Number(this.chain.tip.header.timestamp);
+    const ev = this.events();
+    const candidates = [...ev.planActions].slice(-50);
+    const list = await this.reads(async (read) => {
+      const out = [];
+      const w = await read('UpgradeRegistry', 'waiting');
+      for (const id of (w?.[1] ?? []).map(Number)) {
+        const p = await read('UpgradeRegistry', 'getPlan', [BigInt(id)]);
+        out.push({ id, version: Number(p.version), state: 1, eta: Number(await read('UpgradeRegistry', 'effectiveEta', [BigInt(id)]) ?? p.eta) });
+      }
+      if (!(await read('DevCouncil', 'retired'))) {
+        for (const [id, acts] of candidates) {
+          const last = acts.filter((x) => x.kind === 0).at(-1);
+          if (!last || out.some((x) => x.id === id)) continue;
+          const a = await read('DevCouncil', 'getAction', [BigInt(last.action)]);
+          if (!a || Number(a.state) !== 0 || now > Number(a.proposedAt) + ACTION_TTL) continue;
+          const p = await read('UpgradeRegistry', 'getPlan', [BigInt(id)]);
+          if (p && Number(p.state) === 0) out.push({ id, version: Number(p.version), state: 0, signed: seatsOf(a.approvals).length });
+        }
+      }
+      return out;
+    }).catch(() => []);
+    this.upgradeNow = { tip: this.chain.tip.hash, list };
+  };
+
+  P.upgradeBanner = function () {
+    const list = this.upgradeNow?.list ?? [];
+    if (!list.length) return '';
+    const items = list.slice(0, 3).map((x) => (x.state === 0
+      ? T('Node update to protocol {v} is waiting for dev council signatures ({k} of 2).', { v: `<strong>${esc(versionText(x.version))}</strong>`, k: x.signed })
+      : T('Node update to protocol {v} is approved and takes effect {t}: update your node before then.', { v: `<strong>${esc(versionText(x.version))}</strong>`, t: esc(when(x.eta)) })) +
+      ` <a href="/upgrade/${x.id}">${T('Review')}</a>`).join(' · ');
+    return `<div class="im-banner" role="status"><div class="container">${items}</div></div>`;
+  };
+
+  // ------------------------------------------------------------------ /pause
+
+  P.pausePage = async function () {
+    const d = await this.v8State();
+    const now = Number(this.chain.tip.header.timestamp); // block time, as the contracts judge a pause
+    const live = d.pauses.filter((x) => x.until > now);
+    const cur = PAUSABLE.map(([name, addr]) => {
+      const x = d.pauses.find((y) => y.addr === addr);
+      const on = x && x.until > now;
+      return `<tr><td>${esc(T(name))}</td><td>${on ? badge('paused') : badge('running', true)}</td><td>${on ? `${esc(T(BY[x.by]))} · ${T('until {t}', { t: esc(when(x.until)) })}<div class="muted">${T('reason {r}', { r: `<code>${esc(short(x.reason))}</code>` })}</div>` : '–'}</td></tr>`;
+    });
+    const hist = d.history.map((r) => `<tr><td>${esc(targetName(r.target))}</td><td>${esc(T(BY[Number(r.by)] ?? '?'))}</td><td>${esc(when(r.at))}</td><td>${esc(when(r.until))}${r.endedEarly ? ` <span class="muted">${T('(ended early)')}</span>` : ''}</td><td><code>${esc(short(r.reason))}</code></td></tr>`);
+    const reqs = d.requests.map(({ id, r }) => `<tr><td>${id}</td><td>${esc(targetName(r.target))}</td><td>${T('{a} of 14 · {b} of 4 NGOs', { a: num(r.votes), b: num(r.ngoVotes) })}</td><td>${r.done ? T('paused') : Number(r.openedAt) + 6 * 3600 > now ? T('open until {t}', { t: esc(when(Number(r.openedAt) + 6 * 3600)) }) : T('expired')}</td></tr>`);
+    const options = PAUSABLE.map(([n, a]) => `<option value="${a}">${esc(T(n))}</option>`).join('');
+    const cooldown = d.retired ? T('After the handover the council can start a pause at most once every 7 days') + (d.lastCouncilPause ? ' ' + T('(next from {t})', { t: esc(when(d.lastCouncilPause + 7 * 86400)) }) : '') + (d.lockout > now ? '; ' + T('locked out until {t} because the DAO ended its last pause early', { t: esc(when(d.lockout)) }) : '') + '.' : T('Before the handover the council can pause, renew and end pauses.');
+    const body = `<p class="eyebrow">${T('Emergency pause')}</p><h1>${T('A brake, not a lever.')}</h1>` +
+      `<p class="lead">${T('In a hack or a serious bug, one contract or all transactions can be paused for at most 72 hours. Mining, rewards, votes, upgrades, finality and the 12 % vesting keep running; nobody can move PSY while the whole network is paused, the Dev Account wallets included. Only a DAO vote can pause for longer or end a pause early.')}</p>` +
+      this.walletBar() +
+      `<div class="grid2"><div class="panel stat">${T('Paused now')}<strong>${live.length ? live.map((x) => esc(T(x.name))).join(', ') : T('Not paused: everything runs normally')}</strong></div><div class="panel stat">${T('Dev council')}<strong>${d.retired ? T('pause only') : T('active')}</strong></div></div>` +
+      kv([['Who can pause', d.retired ? T('2 of 3 dev council keys, or the finality committee (14 of 21 members, at least 4 of them NGOs, within 6 hours)') : T('2 of 3 dev council keys')],
+        ['How long', T('72 hours at most, then it lifts by itself; a DAO Emergency proposal (2 days of voting, no timelock) can pause up to 30 days or end a pause')],
+        ['Limits', cooldown + ' ' + T('If the DAO ends a council pause early, the council cannot pause for 30 days. The committee cannot pause the same target again within 7 days.')],
+        ['Never paused', T('the three DevVesting contracts (the 12 %), the Governor, the dev council, the upgrade registry and the pause itself')]]) +
+      `<h2 class="mt-4">${T('Now')}</h2>` + table(['Target', 'State', 'Detail'], cur, '') +
+      `<h2 class="mt-4">${T('Committee requests')}</h2>` + table(['#', 'Target', 'Votes', 'State'], reqs, 'No committee requests.') +
+      `<h2 class="mt-4">${T('History')}</h2>` + table(['Target', 'By', 'From', 'Until', 'Reason'], hist, 'No pauses yet.') +
+      `<h2 class="mt-4">${T('Act')}</h2><div class="grid2">` +
+      this.txForm('EmergencyPause', 'committeeVote', 'Committee member: ask for a pause', [['Target', 'select-address', options], ['Reason (published text; its SHA-256 is stored)', 'text-hash', 'What is wrong']],
+        { note: 'From your committee member wallet. Members who name the same target and the same reason text within 6 hours add up; at 14 votes with 4 NGOs the pause starts.' }) +
+      this.txForm('DevCouncil', 'propose', 'Council key: propose a pause', [['Action', 'hidden', '', '3'], ['Target', 'select-address', options], ['Reason (published text; its SHA-256 is stored)', 'text-hash', 'What is wrong'], ['', 'hidden', '', '0']],
+        { note: 'A second council key approves it on the <a href="/upgrades">upgrades page</a> (Council: approve an action).' }) +
+      '</div>';
+    return this.layout('Emergency pause', body, '/pause', { scripts: this.appScripts() });
+  };
+}
+
+function versionNumberOf(v) { const [a, b, c] = String(v).split('.').map(Number); return a * 1_000_000 + (b || 0) * 1_000 + (c || 0); }

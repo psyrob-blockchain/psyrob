@@ -1,0 +1,296 @@
+// Regression tests for the v11 security audit (BASE-F 2.0, 4 November 2026, commit 2789047). Each test reproduces the
+// audit's proof of concept and fails on the code it was reported against.
+
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
+import { testChain, key, mineOne, blockOn } from './helpers.js';
+import { Rpc, RpcError, SIM_LIMITS } from '../src/rpc.js';
+import { State, encodeLeafForTest } from '../src/state.js';
+import { buildTemplate, templateGasLimit } from '../src/template.js';
+import { signTx } from '../src/tx.js';
+import { contractCall } from '../src/evm.js';
+import { f05Active, mergesetGasLimitAt, F05_MERGESET_GAS } from '../src/rules.js';
+import { ADDR, PROTOCOL_VERSION } from '../src/params.js';
+import { keccak256 } from '../../common/crypto.js';
+import { P2P, MSG, REQUESTS_PER_PEER } from '../src/p2p.js';
+import * as rlp from '../../common/rlp.js';
+import { merkleRootFromLeafHashes, leafHash } from '../../common/merkle.js';
+
+const M = key(7);
+// init code JUMPDEST PUSH1 0 JUMP: an endless loop, run as a contract creation (no contract has to exist)
+const LOOP = '0x5b600056';
+
+// ---------------------------------------------------------------- F-03: RPC work and the chain lock
+
+test('F-03: eth_call loops do not delay block intake', async () => {
+  const t = await testChain();
+  t.advance(10); await mineOne(t, M);
+  const rpc = new Rpc({ chain: t.chain, mempool: t.mempool, p2p: null, finality: null, node: null });
+  t.advance(10);
+  const raw = await blockOn(t, [t.chain.tip.hash], key(8));
+  // the audit's PoC: five endless eth_calls (one client's heavy budget for a second), then a peer's block arrives.
+  // At 2789047 intake waited ~5,000 ms behind them
+  const calls = Array.from({ length: 5 }, () => rpc.handle('eth_call', [{ data: LOOP, gas: '0x989680' }]).catch((e) => e));
+  const a = performance.now();
+  await t.chain.addBlock(raw);
+  const waited = performance.now() - a;
+  const results = await Promise.all(calls);
+  assert.ok(waited < 1500, `block intake waited ${Math.round(waited)} ms behind eth_calls`);
+  for (const r of results) assert.ok(r instanceof RpcError, 'each endless call ends in an error');
+});
+
+test('F-03: simulations are bounded in time and number', async () => {
+  const t = await testChain();
+  t.advance(10); await mineOne(t, M);
+  const rpc = new Rpc({ chain: t.chain, mempool: t.mempool, p2p: null, finality: null, node: null });
+  const a = performance.now();
+  await assert.rejects(rpc.handle('eth_estimateGas', [{ data: LOOP, gas: '0x989680' }]), /time limit|out of gas|failed/);
+  assert.ok(performance.now() - a < SIM_LIMITS.deadlineMs + 1500, 'estimateGas stops near the deadline');
+  // more callers than running + queued places: the rest are told the node is busy straight away
+  const n = SIM_LIMITS.concurrent + SIM_LIMITS.queued + 3;
+  const all = await Promise.all(Array.from({ length: n }, () => rpc.handle('eth_call', [{ data: LOOP }]).catch((e) => e)));
+  const busy = all.filter((e) => e instanceof RpcError && e.code === -32005);
+  assert.equal(busy.length, 3, 'calls beyond the queue are refused as busy');
+  // gas above one block's limit is capped, not run
+  assert.equal(rpc.parseCall({ data: '0x', gas: '0xffffffffff' }).gas, t.chain.p.blockGasLimit);
+});
+
+test('F-03: eth_call reads the state of the moment it started, even while blocks connect', async () => {
+  const t = await testChain();
+  t.advance(10); await mineOne(t, M);
+  const s = new State();
+  const k = 'a' + 'ab'.repeat(20);
+  const v = s.view(); v.set(k, { balance: 5n }); s.commit(v);
+  const snap = s.snapshot();
+  const w = s.view(); w.set(k, { balance: 9n }); w.set('a' + 'cd'.repeat(20), { balance: 1n }); s.commit(w);
+  assert.equal(snap.get(k).balance, 5n, 'the snapshot keeps the old value');
+  assert.equal(snap.get('a' + 'cd'.repeat(20)), undefined, 'and does not see records added later');
+  assert.equal(s.get(k).balance, 9n);
+  snap.release();
+  assert.equal(s.snapshots.size, 0, 'released snapshots are forgotten');
+  assert.throws(() => snap.get(k), /after release/);
+  // the chain-level helper releases its snapshot even when the read throws
+  await assert.rejects(t.chain.readSnapshot(() => { throw new Error('boom'); }), /boom/);
+  assert.equal(t.chain.state.snapshots.size, 0);
+});
+
+test('F-03: rotating miner addresses cannot rebuild templates without limit', async () => {
+  const t = await testChain();
+  t.advance(10); await mineOne(t, M);
+  const rpc = new Rpc({ chain: t.chain, mempool: t.mempool, p2p: null, finality: null, node: null });
+  let built = 0, busy = 0;
+  for (let i = 0; i < 30; i++) {
+    try { await rpc.handle('psy_getBlockTemplate', ['0x' + randomBytes(20).toString('hex')]); built++; } catch (e) { if (e.code === -32005) busy++; else throw e; }
+  }
+  assert.ok(built <= 12, `${built} templates built for fresh miner addresses in a burst`);
+  assert.ok(busy >= 18);
+  // the same miner and tips: answered from the cache, no build
+  const addr = '0x' + randomBytes(20).toString('hex');
+  rpc.buildBudget.tokens = 1;
+  const one = await rpc.handle('psy_getBlockTemplate', [addr]);
+  assert.deepEqual(await rpc.handle('psy_getBlockTemplate', [addr]), one);
+});
+
+// ---------------------------------------------------------------- F-01: state root cost
+
+/** The state root exactly as 2789047 computed it: every record, sorted, hashed from scratch. */
+function referenceRoot(state) {
+  const sorted = [...state.data.keys()].sort();
+  return merkleRootFromLeafHashes(sorted.map((k) => leafHash(encodeLeafForTest(k, state.data.get(k)))));
+}
+
+test('F-01: the incremental state root equals the full recomputation under random changes', () => {
+  const s = new State();
+  const rnd = (n) => Math.floor(Math.random() * n);
+  const addrs = Array.from({ length: 60 }, () => randomBytes(20));
+  const undos = [];
+  for (let round = 0; round < 400; round++) {
+    const v = s.view();
+    const ops = 1 + rnd(12);
+    for (let i = 0; i < ops; i++) {
+      const a = addrs[rnd(addrs.length)];
+      switch (rnd(6)) {
+        case 0: v.setAccount(a, { balance: BigInt(rnd(5)) }); break; // 0 deletes an empty account
+        case 1: v.setAccount(a, { nonce: BigInt(rnd(3)), balance: BigInt(1 + rnd(1e6)) }); break;
+        case 2: v.setStorage(a, randomBytes(32).fill(rnd(4), 0, 31), BigInt(rnd(3))); break;
+        case 3: v.setCode(a, rnd(2) ? randomBytes(1 + rnd(40)) : new Uint8Array(0)); break;
+        case 4: v.clearStorage(a); break;
+        default: v.setGlobal({ burned: BigInt(rnd(1e9)) });
+      }
+    }
+    // sometimes a fresh, never-seen key (inserted anywhere in the order)
+    if (rnd(3) === 0) v.setAccount(randomBytes(20), { balance: 1n });
+    const undo = s.commit(v);
+    undos.push(undo);
+    // rootWith-style: commit, root, revert, as templates do
+    if (rnd(4) === 0) { const w = s.view(); w.setAccount(randomBytes(20), { balance: 7n }); assert.deepEqual(s.rootWith(w), (() => { const u = s.commit(w); const r = referenceRoot(s); s.revert(u); return r; })()); }
+    // sometimes undo the last few blocks (reorgs)
+    if (rnd(5) === 0) for (let k = rnd(3); k > 0 && undos.length; k--) s.revert(undos.pop());
+    // not every block asks for the root: changes pile up between roots too
+    if (rnd(3) !== 0) assert.deepEqual(s.root(), referenceRoot(s), `round ${round}`);
+  }
+  assert.deepEqual(s.root(), referenceRoot(s));
+  // and down to an empty state
+  for (const u of undos.reverse()) s.revert(u);
+  assert.deepEqual(s.root(), referenceRoot(s));
+});
+
+test('F-01: a block that changes existing records does not rehash the whole state', () => {
+  const s = new State();
+  const v = s.view();
+  const addrs = Array.from({ length: 50_000 }, () => randomBytes(20));
+  for (const a of addrs) v.setAccount(a, { balance: 1n });
+  s.commit(v);
+  s.root();
+  // a typical block: some transfers between existing accounts and a reward to an existing miner
+  const w = s.view();
+  for (let i = 0; i < 40; i++) w.setAccount(addrs[i * 997 % addrs.length], { balance: 5n + BigInt(i) });
+  s.commit(w);
+  const r = s.root();
+  assert.ok(s.rootStats().lastRehashed < 40 * 20, `rehashed ${s.rootStats().lastRehashed} nodes for 40 changed records`);
+  assert.deepEqual(r, referenceRoot(s));
+});
+
+// ---------------------------------------------------------------- F-05: gas against JavaScript execution time
+
+test('F-05: blocks built here keep their transactions within the base-fee target, and a large one still gets in', async () => {
+  const t = await testChain({ params: { maxSupply: 10n ** 30n } });
+  const S = key(3);
+  for (let i = 0; i < 3; i++) { t.advance(10); await mineOne(t, S); }
+  const add = async (nonce, gasLimit) => {
+    const tx = signTx({ type: 2, nonce, to: new Uint8Array(20).fill(0xee), value: 1n, gasLimit, maxFee: 20_000_000_000n, maxPriorityFee: 1n }, S.sk, t.params);
+    await t.chain.readAtTip((v, ctx) => t.mempool.add(tx.raw, v, ctx.baseFee, ctx.timestamp));
+    return tx;
+  };
+  const cap = templateGasLimit(t.params);
+  assert.equal(cap, t.params.baseFeeTarget);
+  // 3 x 2 M gas: two fit under the 5 M target, the third waits for the next block
+  const n0 = t.chain.state.getAccount(S.addr).nonce;
+  for (let i = 0n; i < 3n; i++) await add(n0 + i, 2_000_000);
+  let tpl = await buildTemplate(t.chain, t.mempool, S.addr);
+  assert.equal(tpl.txRaws.length, 2);
+  // a single 9 M-gas transaction (over the policy, within the block limit) is mined alone, not shut out
+  const t2 = await testChain({ params: { maxSupply: 10n ** 30n } });
+  for (let i = 0; i < 3; i++) { t2.advance(10); await mineOne(t2, S); }
+  const big = signTx({ type: 2, nonce: t2.chain.state.getAccount(S.addr).nonce, to: new Uint8Array(20).fill(0xee), value: 1n, gasLimit: 9_000_000, maxFee: 20_000_000_000n, maxPriorityFee: 1n }, S.sk, t2.params);
+  await t2.chain.readAtTip((v, ctx) => t2.mempool.add(big.raw, v, ctx.baseFee, ctx.timestamp));
+  tpl = await buildTemplate(t2.chain, t2.mempool, S.addr);
+  assert.equal(tpl.txRaws.length, 1);
+  // an explicit --template-gas of the block limit restores the old behaviour
+  tpl = await buildTemplate(t.chain, t.mempool, S.addr, { gasLimit: t.params.blockGasLimit });
+  assert.equal(tpl.txRaws.length, 3);
+});
+
+// The audit's workload and the other cheap ones: a contract calling one precompile (or running one opcode) in a loop
+// until 10 M gas run out. Protocol 10.1.0 (rules.js) lowers the mergeset budget to 10 M and raises the four precompiles
+// that were slower per gas than any ordinary code.
+const Gx = '79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798';
+const G1 = '00'.repeat(31) + '01' + '00'.repeat(31) + '02';
+const G2 = '198e9393920d483a7260bfb731fb5d25f1aa493335a9e71297e485b7aef312c2' + '1800deef121f1e76426a00665e5c4479674322d4f75edadd46debd5cd992f6ed' +
+  '090689d0585ff075ec9e99ad690c3395bc4b313370b38ef355acdadcd122975b' + '12c85ea5db8c6deb4aab71808dcb408fe3d1e7690c43d37b4ce6cc0166fa7daa';
+const w32 = (n) => BigInt(n).toString(16).padStart(64, '0');
+const PRECOMPILE_LOADS = [
+  ['ecrecover', 1, w32(1) + w32(27) + Gx + w32(1), 2],
+  ['bn254 mul', 7, G1 + 'ff'.repeat(32), 3],
+  ['bn254 pairing', 8, G1 + G2, 119000 / 79000],
+  ['blake2f', 9, '000f4240' + '00'.repeat(64 + 128 + 16) + '01', 2],
+];
+const p2 = (n) => n.toString(16).padStart(4, '0');
+const precompileLoop = (addr, input) => '61' + p2(input.length / 2) + '61' + p2(30) + '600039' + '5b' + '610100614000' + '61' + p2(input.length / 2) + '6000' + '60' + addr.toString(16).padStart(2, '0') + '5afa50600956' + '00' + input;
+async function secondsPer10M(t, codeHex, f05) {
+  const code = Uint8Array.from(Buffer.from(codeHex, 'hex'));
+  const addr = new Uint8Array(20).fill(0xab);
+  return t.chain.readAtTip(async (view, ctx) => {
+    view.setCode(addr, code); view.setAccount(addr, { codeHash: keccak256(code), nonce: 1n });
+    const a = performance.now();
+    const r = await contractCall(view, t.params, { ...ctx, f05 }, { to: addr, gasLimit: 10_000_000n, commit: false });
+    assert.equal(r.gasUsed, 10_000_000n);
+    return (performance.now() - a) / 1000;
+  });
+}
+
+test('F-05: protocol 10.1.0 prices: the slow precompiles cost more gas, so 10 M gas buys proportionally fewer calls', async (tc) => {
+  const t = await testChain();
+  t.advance(10); await mineOne(t, M);
+  // calls per 10 M gas, counted from the gas each call charges (deterministic); the seconds are printed for the record
+  // only: node:test makes every await several times slower, so wall-clock limits belong to scripts/gas-bench.mjs
+  const report = [];
+  for (const [name, addr, input, ratio] of PRECOMPILE_LOADS) {
+    const before = await secondsPer10M(t, precompileLoop(addr, input), false);
+    const after = await secondsPer10M(t, precompileLoop(addr, input), true);
+    report.push(`${name} ${before.toFixed(2)} -> ${after.toFixed(2)} s`);
+    const gas = async (f05) => t.chain.readAtTip(async (view, ctx) => {
+      const to = new Uint8Array(20); to[19] = addr;
+      const r = await contractCall(view, t.params, { ...ctx, f05 }, { to, data: Uint8Array.from(Buffer.from(input, 'hex')), gasLimit: 10_000_000n, commit: false });
+      assert.equal(r.status, 1, `${name} input is valid`);
+      return r.gasUsed;
+    });
+    const r = Number(await gas(true)) / Number(await gas(false));
+    assert.ok(Math.abs(r - ratio) < 0.01, `${name} price ratio ${r}`);
+  }
+  tc.diagnostic(report.join('; ') + ' per 10 M gas under node:test');
+});
+
+test('F-05: the 10.1.0 rules apply only once the network requires protocol 10.1.0; before, the old budget and prices', async () => {
+  const t = await testChain();
+  t.advance(10); await mineOne(t, M);
+  const ecrecoverGas = (view, ctx, f05) => contractCall(view, t.params, { ...ctx, f05 }, { to: (() => { const a = new Uint8Array(20); a[19] = 1; return a; })(), data: Uint8Array.from(Buffer.from(w32(1) + w32(27) + Gx + w32(1), 'hex')), gasLimit: 100_000n, commit: false });
+  await t.chain.readAtTip(async (view, ctx) => {
+    assert.equal(f05Active(view), false);
+    assert.equal(mergesetGasLimitAt(view, t.params), 30_000_000n);
+    assert.equal((await ecrecoverGas(view, ctx)).gasUsed, 3000n);
+    for (const [v, on] of [[10_000_000, false], [10_000_001, false], [10_001_000, true], [10_002_000, true]]) {
+      const x = view.view();
+      x.setStorage(ADDR.upgradeRegistry, (() => { const b = new Uint8Array(32); b[31] = 4; return b; })(), BigInt(v));
+      assert.equal(f05Active(x), on, `required ${v}`);
+      assert.equal(mergesetGasLimitAt(x, t.params), on ? 10_000_000n : 30_000_000n);
+      assert.equal((await ecrecoverGas(x, ctx)).gasUsed, on ? 6000n : 3000n, 'the view decides when ctx.f05 is not set');
+    }
+  });
+  assert.equal(PROTOCOL_VERSION, '10.1.0');
+  assert.ok(F05_MERGESET_GAS <= t.params.blockGasLimit && F05_MERGESET_GAS >= t.params.blockGasLimit, 'every valid transaction still fits a mergeset');
+});
+
+// ---------------------------------------------------------------- F-04: deep parents
+
+test('F-04: a block naming one parent below the merge depth is refused before any DAG walk', async () => {
+  const t = await testChain({ params: { mergeDepth: 20 } });
+  const hashes = [];
+  for (let i = 0; i < 60; i++) { t.advance(10); await mineOne(t, M); hashes.push(t.chain.tip.hash); }
+  t.advance(10);
+  const evil = await blockOn(t, [t.chain.tip.hash, hashes[2]], key(9));
+  // count reachability walks during intake: there must be none
+  let walks = 0;
+  const isAncestor = t.chain.dag.isAncestor.bind(t.chain.dag), mergesetOf = t.chain.dag.mergesetOf.bind(t.chain.dag);
+  t.chain.dag.isAncestor = (...a) => { walks++; return isAncestor(...a); };
+  t.chain.dag.mergesetOf = (...a) => { walks++; return mergesetOf(...a); };
+  await assert.rejects(t.chain.addBlock(evil), /parent below the merge depth/);
+  assert.equal(walks, 0, 'no reachability walk for a block the merge-depth rule refuses');
+  // an honest block on the tip is still accepted
+  t.chain.dag.isAncestor = isAncestor; t.chain.dag.mergesetOf = mergesetOf;
+  const ok = await blockOn(t, [t.chain.tip.hash], key(10));
+  assert.equal((await t.chain.addBlock(ok)).status, 'added');
+});
+
+// ---------------------------------------------------------------- F-06: INV floods and solicited blocks
+
+test('F-06: an INV flood cannot erase which blocks were asked of an honest peer', async () => {
+  const chain = { dag: { has: () => false, tips: new Set() }, orphans: new Map(), txIndex: new Map(), tip: { blueScore: 0 }, chain: [] };
+  const p2p = new P2P({ params: { networkMagic: 1, chainId: 1n, protocolVersion: 10 }, chain, mempool: { get: () => null }, genesisHash: new Uint8Array(32), seeds: [], log: () => {} });
+  const fakePeer = (id) => ({ id, host: id, known: new Set(), sent: 0, score: 0, sendRlp() { this.sent++; }, misbehave(p) { this.score += p; } });
+  const honest = fakePeer('honest-sync-peer'), attacker = fakePeer('attacker');
+  const batch = Array.from({ length: 500 }, () => randomBytes(32).toString('hex'));
+  for (const h of batch) p2p.markRequested(h, honest);
+  // the audit's PoC: 41 INV messages of 500 random block hashes (at 2789047 this cleared the map: 500 -> 0)
+  for (let m = 0; m < 41; m++) await p2p.handle(attacker, MSG.INV, rlp.encode(Array.from({ length: 500 }, () => [rlp.int(1), randomBytes(32)])));
+  assert.equal(batch.filter((h) => p2p.requestedFrom(h, honest)).length, 500, 'every block of the batch is still solicited');
+  assert.ok(attacker.reqs.size <= REQUESTS_PER_PEER, 'the attacker is asked for at most its share');
+  assert.ok(p2p.requested.size <= 500 + REQUESTS_PER_PEER);
+  // the honest peer's own requests beyond its cap displace only its own oldest ones
+  for (let i = 0; i < REQUESTS_PER_PEER; i++) p2p.markRequested(randomBytes(32).toString('hex'), honest);
+  assert.equal(honest.reqs.size, REQUESTS_PER_PEER);
+  // a closed peer's requests are forgotten
+  p2p.onClose(attacker);
+  assert.ok([...p2p.requested.values()].every((r) => r.peer !== attacker));
+});

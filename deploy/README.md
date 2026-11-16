@@ -1,0 +1,40 @@
+# Operating the public node
+
+These files run the public PSYROB node behind https://rpc.psyrob.com and https://explorer.psyrob.com. They are a
+reference for operators; a normal node needs none of them (see the main `README.md` or `docs/WINDOWS-NODE.md`).
+
+Layout of the public server: a user `psycho`; the code in `/home/psycho/psyrob`; the production clone the services run
+from in `/home/psycho/psyrob`; keys in `/etc/psyrob`; node data in `/var/lib/psyrob`. The services run as the
+user `psyrob`. Adjust the paths at the top of each file for another server.
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `psyrob.service` | systemd unit of the node; signs bootstrap checkpoints with the three bootstrap keys |
+| `psyrob.prelaunch.service` | the node unit's pre-launch form: serves only the launch ceremony page |
+| `psyrob-miner.service`, `psyrob-miner.service.d/limits.conf` | systemd unit of the miner and its CPU limits (the miner address is in the drop-in `address.conf`, written by `KEYS.sh`) |
+| `psyrob-watchdog.sh`, `.service`, `.timer` | health check every minute: restarts the node when `/health` fails 5 checks in a row (no answer within 15 s, or the wrong genesis), leaves a starting node alone, restarts the tunnel when only the public names fail |
+| `check-before-mining.sh` | checks temperature, free memory and the node before the miner starts |
+| `KEYS.sh` | step 1: makes the three bootstrap keys, the miner key and the release key (never prints a private key) and writes their public parts into `genesis/launch-87870.json` and `docs/RELEASE-KEY.pem` |
+| `PRELAUNCH.sh` | step 2: serves the launch ceremony page |
+| `LAUNCH.sh` | step 3: builds the genesis from the signed ceremony, builds and signs the downloads, installs the units and starts the network |
+
+## Launch (chain 87870)
+
+Testnet v11 (2 November 2026) was a relaunch: a fresh chain from a new genesis on the same chain ID, Dev Accounts and
+keys as v10. For a relaunch, skip steps 0 and 1 (the keys exist), commit and tag `vX.0.0-prelaunch` with the new label in
+`genesis/launch-87870.json` (`extra`), set `TAG` in `PRELAUNCH.sh` and `LAUNCH.sh`, then run steps 2 and 3.
+`PRELAUNCH.sh` stops the watchdog and moves the earlier ceremony file aside; `LAUNCH.sh` accepts only a ceremony with
+the new label; the node moves the blocks of the earlier chain aside by itself when it starts on the new genesis.
+
+0. The production clone: `git clone /home/psycho/psyrob /home/psycho/psyrob && cd /home/psycho/psyrob && npm ci`
+   (as `psycho`), and an empty data folder: `sudo install -d -m 0750 -o psyrob -g psyrob /var/lib/psyrob`.
+1. `sudo bash deploy/KEYS.sh`, then commit `genesis/launch-87870.json` and `docs/RELEASE-KEY.pem` and tag
+   `v10.0.0-prelaunch`. Back up `/etc/psyrob/*.key` and `/home/psycho/.psyrob-release/release.key` offline.
+2. `sudo bash deploy/PRELAUNCH.sh`: https://explorer.psyrob.com/launch shows the ceremony; the three Dev Account
+   holders sign.
+3. `sudo bash deploy/LAUNCH.sh`.
+
+Memory: the node may take up to 2.5 GB (2 GiB heap; usually far less since 11.0.1). A contract compile (`forge build`, via-IR) needs about 2 GB more:
+pause other services first on this 3.3 GB server.
