@@ -1,10 +1,11 @@
-# PSYROB testnet v11.0
+# PSYROB Public Mainnet v1.0.0
+
 
 A block-DAG network with CPU mining. NGOs are elected on-chain and share the emission with miners.
 
 - **Consensus:** GHOSTDAG ordering (k = 18), about one block every 10 seconds, up to 10 parents per block. Parallel blocks are merged; a conflicting transaction is skipped, not fatal.
 - **Proof of work:** Argon2d with 32 MiB per attempt. Every attempt is signed by the miner wallet, so the work cannot be handed to a pool operator without the reward key.
-- **Supply:** maximum 1,000,000,000 PSY (18 decimals).
+- **Supply:** maximum 1,000,000,000 PSY.
   - 36 % to miners and 36 % to elected NGOs, on the same smoothly decaying schedule;
   - 12 % to the development team, in immutable vesting that nothing can change, block or pause;
   - 16 % to the Community/Treasury allocation.
@@ -29,7 +30,6 @@ A block-DAG network with CPU mining. NGOs are elected on-chain and share the emi
 | `node/` | the full node: consensus, P2P with peer discovery, JSON-RPC, explorer and participation pages, wallet tool |
 | `miner/` | the separate miner application |
 | `common/` | code shared by the node and the miner: header, Argon2d proof of work, RLP, crypto, ABI codec |
-| `contracts/` | Solidity contracts and Foundry tests; `contracts/src/bnb/` holds the BNB Chain volunteer fund |
 | `genesis/` | contract artifacts used to build the genesis state, the genesis file, chain metadata, the genesis check and seed peers |
 | `deploy/` | how the public node is operated: systemd units, the watchdog, the pre-mining check and the launch scripts (`deploy/README.md`) |
 | `docs/` | the specification (`docs/dag/DAG_SPEC.md`), the research notes with 202 verified peer-reviewed sources (`docs/research/RESEARCH.md`), the security analysis (`docs/SECURITY.md`), the decisions (`docs/DECISIONS.md`) and the operator notes |
